@@ -1,8 +1,10 @@
 __pycache__/
 dist/
+local/
 *.py[cod]
 *$py.class
 *.egg-info/
 .DS_Store
 .idea/
+.vscode/
 .ruff_cache/
