@@ -8,3 +8,10 @@ local/
 .idea/
 .vscode/
 .ruff_cache/
+._*
+exp/
+data_gen_scripts/data/
+data_gen_scripts/experts/
+
+*.log
+*.mp4
