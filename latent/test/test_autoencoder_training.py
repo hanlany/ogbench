@@ -17,6 +17,7 @@ from latent.train.train_autoencoder import (
     create_validation_batches,
     eval_step,
     normalize_observations,
+    maybe_reduce_lr,
     restore_checkpoint,
     save_checkpoint,
     split_autoencoder_params,
@@ -39,6 +40,10 @@ def make_training_config(save_dir):
         restore_step=None,
         wandb_mode='disabled',
         lr=1e-3,
+        min_lr=1e-6,
+        lr_plateau_patience=5,
+        lr_plateau_factor=0.5,
+        lr_plateau_min_delta=1e-4,
         batch_size=4,
         train_steps=2,
         log_interval=1,
@@ -99,6 +104,34 @@ class AutoencoderTrainingTest(unittest.TestCase):
                 validate_training_config(replace(training_config, lr=0.0))
             with self.assertRaises(ValueError):
                 validate_model_config(make_model_config(obs_dim=2))
+
+    def test_plateau_reduction_updates_optimizer_lr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            training_config = replace(
+                make_training_config(tmpdir),
+                lr=1e-3,
+                min_lr=1e-5,
+                lr_plateau_patience=1,
+                lr_plateau_factor=0.5,
+                lr_plateau_min_delta=0.0,
+            )
+            state = create_train_state(0, make_model_config(obs_dim=3), training_config)
+
+            state, current_lr, best_metric, plateau_count, lr_reduced = maybe_reduce_lr(
+                state,
+                training_config.lr,
+                metric=1.0,
+                best_metric=1.0,
+                plateau_count=0,
+                config=training_config,
+            )
+
+            self.assertTrue(lr_reduced)
+            self.assertEqual(plateau_count, 0)
+            self.assertEqual(best_metric, 1.0)
+            self.assertAlmostEqual(current_lr, 5e-4)
+            opt_lr = float(np.asarray(state.opt_state.hyperparams['learning_rate']))
+            self.assertAlmostEqual(opt_lr, 5e-4)
 
     def test_train_eval_and_checkpoint_round_trip(self):
         with tempfile.TemporaryDirectory() as tmpdir:

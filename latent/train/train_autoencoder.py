@@ -46,7 +46,7 @@ flags.DEFINE_string('restore_path', None, 'Path to a checkpoint file or director
 flags.DEFINE_integer('restore_step', None, 'Checkpoint step to restore when restore_path is a directory.')
 flags.DEFINE_enum('wandb_mode', 'online', ['online', 'offline', 'disabled'], 'Weights & Biases mode.')
 
-flags.DEFINE_integer('latent_dim', 2, 'Latent dimension.')
+flags.DEFINE_integer('latent_dim', 12, 'Latent dimension.')
 flags.DEFINE_list('hidden_dims', ['512', '512'], 'Comma-separated hidden dimensions for the encoder MLP.')
 flags.DEFINE_list('decoder_hidden_dims', None, 'Optional comma-separated hidden dimensions for the decoder MLP.')
 flags.DEFINE_enum('activation', 'gelu', ['elu', 'gelu', 'relu', 'swish', 'tanh'], 'MLP activation.')
@@ -54,6 +54,10 @@ flags.DEFINE_bool('layer_norm', False, 'Whether to use layer normalization after
 flags.DEFINE_bool('decoder_activate_final', False, 'Whether to apply the activation to decoder outputs.')
 flags.DEFINE_float('dropout_rate', 0.0, 'Dropout rate for hidden layers.')
 flags.DEFINE_float('lr', 3e-4, 'Learning rate.')
+flags.DEFINE_float('min_lr', 1e-6, 'Minimum learning rate after plateau reductions.')
+flags.DEFINE_integer('lr_plateau_patience', 5, 'Number of logging intervals without improvement before reducing LR; 0 disables reductions.')
+flags.DEFINE_float('lr_plateau_factor', 0.5, 'Multiplier applied to LR when the monitored metric plateaus.')
+flags.DEFINE_float('lr_plateau_min_delta', 1e-4, 'Minimum metric improvement required to reset LR plateau patience.')
 flags.DEFINE_integer('batch_size', 1024, 'Batch size.')
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -94,6 +98,10 @@ class TrainingConfig:
     restore_step: int | None
     wandb_mode: str
     lr: float
+    min_lr: float
+    lr_plateau_patience: int
+    lr_plateau_factor: float
+    lr_plateau_min_delta: float
     batch_size: int
     train_steps: int
     log_interval: int
@@ -148,6 +156,10 @@ def create_configs(obs_dim=None):
         restore_step=FLAGS.restore_step,
         wandb_mode=FLAGS.wandb_mode,
         lr=FLAGS.lr,
+        min_lr=FLAGS.min_lr,
+        lr_plateau_patience=FLAGS.lr_plateau_patience,
+        lr_plateau_factor=FLAGS.lr_plateau_factor,
+        lr_plateau_min_delta=FLAGS.lr_plateau_min_delta,
         batch_size=FLAGS.batch_size,
         train_steps=FLAGS.train_steps,
         log_interval=FLAGS.log_interval,
@@ -189,6 +201,16 @@ def validate_training_config(config):
         raise ValueError(f'prefetch_batches must be non-negative, got {config.prefetch_batches}.')
     if config.lr <= 0:
         raise ValueError(f'lr must be positive, got {config.lr}.')
+    if config.min_lr <= 0:
+        raise ValueError(f'min_lr must be positive, got {config.min_lr}.')
+    if config.min_lr > config.lr:
+        raise ValueError(f'min_lr must be <= lr, got min_lr={config.min_lr}, lr={config.lr}.')
+    if config.lr_plateau_patience < 0:
+        raise ValueError(f'lr_plateau_patience must be non-negative, got {config.lr_plateau_patience}.')
+    if not 0 < config.lr_plateau_factor < 1:
+        raise ValueError(f'lr_plateau_factor must be in (0, 1), got {config.lr_plateau_factor}.')
+    if config.lr_plateau_min_delta < 0:
+        raise ValueError(f'lr_plateau_min_delta must be non-negative, got {config.lr_plateau_min_delta}.')
     if config.normalization_eps <= 0:
         raise ValueError(f'normalization_eps must be positive, got {config.normalization_eps}.')
 
@@ -275,7 +297,7 @@ def create_train_state(seed, model_config, training_config):
     )
     rng = jax.random.PRNGKey(seed)
     params = model_def.init(rng, jnp.zeros((1, model_config.obs_dim), dtype=jnp.float32))['params']
-    tx = optax.adam(learning_rate=training_config.lr)
+    tx = optax.inject_hyperparams(optax.adam)(learning_rate=training_config.lr)
     return TrainState.create(model_def, params, tx=tx)
 
 
@@ -344,7 +366,14 @@ def save_checkpoint(state, save_dir, step, training_config, model_config, normal
         'flags': flag_dict,
         'training_config': config_to_dict(training_config),
         'model_config': config_to_dict(model_config),
-        'optimizer_config': {'name': 'adam', 'learning_rate': training_config.lr},
+        'optimizer_config': {
+            'name': 'adam',
+            'learning_rate': training_config.lr,
+            'min_learning_rate': training_config.min_lr,
+            'plateau_patience': training_config.lr_plateau_patience,
+            'plateau_factor': training_config.lr_plateau_factor,
+            'plateau_min_delta': training_config.lr_plateau_min_delta,
+        },
         'normalization': normalization_stats.to_dict(),
         'autoencoder': flax.serialization.to_state_dict(state),
         'params': flax.serialization.to_state_dict(state.params),
@@ -398,6 +427,32 @@ def average_metrics(metric_dicts):
         return {}
     keys = metric_dicts[0].keys()
     return {key: float(np.mean([metrics[key] for metrics in metric_dicts])) for key in keys}
+
+
+def set_optimizer_lr(state, learning_rate):
+    """Update the injected Optax learning rate without resetting optimizer moments."""
+    opt_state = state.opt_state
+    if not hasattr(opt_state, 'hyperparams') or 'learning_rate' not in opt_state.hyperparams:
+        raise ValueError('Optimizer state does not expose an injectable learning_rate hyperparameter.')
+    hyperparams = dict(opt_state.hyperparams)
+    hyperparams['learning_rate'] = jnp.asarray(learning_rate, dtype=hyperparams['learning_rate'].dtype)
+    return state.replace(opt_state=opt_state._replace(hyperparams=hyperparams))
+
+
+def maybe_reduce_lr(state, current_lr, metric, best_metric, plateau_count, config):
+    """Reduce LR when the monitored metric stops improving."""
+    if metric < best_metric - config.lr_plateau_min_delta:
+        return state, current_lr, metric, 0, False
+
+    plateau_count += 1
+    if config.lr_plateau_patience == 0 or plateau_count < config.lr_plateau_patience or current_lr <= config.min_lr:
+        return state, current_lr, best_metric, plateau_count, False
+
+    new_lr = max(current_lr * config.lr_plateau_factor, config.min_lr)
+    if new_lr >= current_lr:
+        return state, current_lr, best_metric, plateau_count, False
+    state = set_optimizer_lr(state, new_lr)
+    return state, new_lr, best_metric, 0, True
 
 
 class BatchPrefetcher:
@@ -498,6 +553,9 @@ def run_training(training_config, model_config):
         training_config.prefetch_batches,
     )
     train_logger = CsvLogger(os.path.join(training_config.save_dir, 'train.csv'))
+    current_lr = training_config.lr
+    best_plateau_metric = float('inf')
+    plateau_count = 0
     rng = jax.random.PRNGKey(training_config.seed + 1)
     first_time = time.time()
     last_time = time.time()
@@ -510,10 +568,24 @@ def run_training(training_config, model_config):
 
             if i % training_config.log_interval == 0:
                 metrics = {f'training/{k}': v for k, v in to_float_dict(update_info).items()}
+                plateau_metric_name = 'training/mse'
                 if len(val_batches) > 0:
                     val_metric_dicts = [to_float_dict(eval_step(state, val_batch, mean, std)) for val_batch in val_batches]
                     metrics.update({f'validation/{k}': v for k, v in average_metrics(val_metric_dicts).items()})
-                metrics['optimizer/lr'] = training_config.lr
+                    plateau_metric_name = 'validation/mse'
+                state, current_lr, best_plateau_metric, plateau_count, lr_reduced = maybe_reduce_lr(
+                    state,
+                    current_lr,
+                    metrics[plateau_metric_name],
+                    best_plateau_metric,
+                    plateau_count,
+                    training_config,
+                )
+                training_config = replace(training_config, lr=current_lr)
+                metrics['optimizer/lr'] = current_lr
+                metrics['optimizer/lr_plateau_metric'] = metrics[plateau_metric_name]
+                metrics['optimizer/lr_plateau_count'] = plateau_count
+                metrics['optimizer/lr_reduced'] = float(lr_reduced)
                 metrics['time/epoch_time'] = (time.time() - last_time) / training_config.log_interval
                 metrics['time/total_time'] = time.time() - first_time
                 last_time = time.time()
