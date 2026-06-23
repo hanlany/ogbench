@@ -9,11 +9,12 @@ os.environ.setdefault('MUJOCO_GL', 'egl')
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMPLS_DIR = REPO_ROOT / 'impls'
-if str(IMPLS_DIR) not in sys.path:
-    sys.path.insert(0, str(IMPLS_DIR))
+for path in (REPO_ROOT, IMPLS_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from agents import SACAgent  # noqa: E402
-from ogbench.local.vis import OGBenchVisualizer  # noqa: E402
+from latent.vis import OGBenchVisualizer  # noqa: E402
 from utils.flax_utils import restore_agent  # noqa: E402
 
 
