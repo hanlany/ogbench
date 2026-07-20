@@ -72,16 +72,27 @@ flags.DEFINE_integer(
 flags.DEFINE_enum('wandb_mode', 'online', ['online', 'offline', 'disabled'], 'Weights & Biases mode.', **_FLAG_KWARGS)
 flags.DEFINE_string('ae_checkpoint_path', None, 'Path to a trained autoencoder checkpoint.', **_FLAG_KWARGS)
 
-flags.DEFINE_list('hidden_dims', ['512', '512'], 'Comma-separated hidden dimensions for the dynamics MLP.', **_FLAG_KWARGS)
+flags.DEFINE_list(
+    'hidden_dims', ['512', '512'], 'Comma-separated hidden dimensions for the dynamics MLP.', **_FLAG_KWARGS
+)
 flags.DEFINE_enum('activation', 'gelu', ['elu', 'gelu', 'relu', 'swish', 'tanh'], 'MLP activation.', **_FLAG_KWARGS)
 flags.DEFINE_bool('layer_norm', False, 'Whether to use layer normalization after hidden dense layers.', **_FLAG_KWARGS)
 flags.DEFINE_float('dropout_rate', 0.0, 'Dropout rate for hidden layers.', **_FLAG_KWARGS)
+flags.DEFINE_enum(
+    'prediction_type',
+    'absolute',
+    ['absolute', 'residual'],
+    'Predict an absolute next latent or a residual added to the current latent.',
+    **_FLAG_KWARGS,
+)
 flags.DEFINE_float('lr', 3e-4, 'Learning rate.', **_FLAG_KWARGS)
 flags.DEFINE_integer('batch_size', 1024, 'Batch size.', **_FLAG_KWARGS)
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.', **_FLAG_KWARGS)
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.', **_FLAG_KWARGS)
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.', **_FLAG_KWARGS)
-flags.DEFINE_integer('prefetch_batches', 2, 'Number of host batches to prefetch; 0 disables prefetching.', **_FLAG_KWARGS)
+flags.DEFINE_integer(
+    'prefetch_batches', 2, 'Number of host batches to prefetch; 0 disables prefetching.', **_FLAG_KWARGS
+)
 flags.DEFINE_integer(
     'validation_batches',
     16,
@@ -98,13 +109,22 @@ flags.DEFINE_integer(
 
 flags.DEFINE_float('recon_weight', 1.0, 'Weight for decoded next-observation reconstruction loss.', **_FLAG_KWARGS)
 flags.DEFINE_float('latent_weight', 1.0, 'Weight for latent prediction loss.', **_FLAG_KWARGS)
+flags.DEFINE_enum(
+    'latent_loss_mode',
+    'l2',
+    ['l2', 'gramian'],
+    'Latent objective: pure squared L2 error or the annealed controllability-Gramian loss.',
+    **_FLAG_KWARGS,
+)
 flags.DEFINE_integer(
     'gramian_warmup_steps',
     100000,
     'Steps over which to anneal from L2 to Gramian latent loss.',
     **_FLAG_KWARGS,
 )
-flags.DEFINE_float('gramian_diag_eps', 1e-4, 'Diagonal regularizer added to each controllability Gramian.', **_FLAG_KWARGS)
+flags.DEFINE_float(
+    'gramian_diag_eps', 1e-4, 'Diagonal regularizer added to each controllability Gramian.', **_FLAG_KWARGS
+)
 flags.DEFINE_bool(
     'differentiate_gramian',
     False,
@@ -121,6 +141,7 @@ class DynamicsModelConfig:
     activation: str
     layer_norm: bool
     dropout_rate: float
+    prediction_type: str = 'absolute'
 
 
 @dataclass(frozen=True)
@@ -153,6 +174,7 @@ class DynamicsLossConfig:
     gramian_warmup_steps: int
     gramian_diag_eps: float
     differentiate_gramian: bool
+    latent_loss_mode: str = 'l2'
 
 
 def create_configs(latent_dim=-1, action_dim=-1):
@@ -186,6 +208,7 @@ def create_configs(latent_dim=-1, action_dim=-1):
         activation=FLAGS.activation,
         layer_norm=FLAGS.layer_norm,
         dropout_rate=FLAGS.dropout_rate,
+        prediction_type=FLAGS.prediction_type,
     )
     loss_config = DynamicsLossConfig(
         recon_weight=FLAGS.recon_weight,
@@ -193,6 +216,7 @@ def create_configs(latent_dim=-1, action_dim=-1):
         gramian_warmup_steps=FLAGS.gramian_warmup_steps,
         gramian_diag_eps=FLAGS.gramian_diag_eps,
         differentiate_gramian=FLAGS.differentiate_gramian,
+        latent_loss_mode=FLAGS.latent_loss_mode,
     )
     return training_config, model_config, loss_config
 
@@ -228,6 +252,8 @@ def validate_model_config(config: DynamicsModelConfig):
         raise ValueError(f'action_dim must be positive, got {config.action_dim}.')
     if config.dropout_rate < 0 or config.dropout_rate >= 1:
         raise ValueError(f'dropout_rate must be in [0, 1), got {config.dropout_rate}.')
+    if config.prediction_type not in ('absolute', 'residual'):
+        raise ValueError(f'prediction_type must be one of (absolute, residual), got {config.prediction_type!r}.')
 
 
 def validate_loss_config(config: DynamicsLossConfig):
@@ -238,6 +264,8 @@ def validate_loss_config(config: DynamicsLossConfig):
         raise ValueError(f'latent_weight must be non-negative, got {config.latent_weight}.')
     if config.recon_weight == 0 and config.latent_weight == 0:
         raise ValueError('At least one of recon_weight or latent_weight must be positive.')
+    if config.latent_loss_mode not in ('l2', 'gramian'):
+        raise ValueError(f'latent_loss_mode must be one of (l2, gramian), got {config.latent_loss_mode!r}.')
     if config.gramian_warmup_steps < 0:
         raise ValueError(f'gramian_warmup_steps must be non-negative, got {config.gramian_warmup_steps}.')
     if config.gramian_diag_eps <= 0:
@@ -338,6 +366,7 @@ def create_train_state(seed, model_config: DynamicsModelConfig, training_config:
         activation=model_config.activation,
         layer_norm=model_config.layer_norm,
         dropout_rate=model_config.dropout_rate,
+        prediction_type=model_config.prediction_type,
     )
     rng = jax.random.PRNGKey(seed)
     params = model_def.init(
@@ -420,6 +449,7 @@ def dynamics_loss(
     latent_weight,
     gramian_diag_eps,
     differentiate_gramian,
+    latent_loss_mode,
     deterministic,
     rng=None,
 ):
@@ -442,17 +472,30 @@ def dynamics_loss(
     latent_l2 = jnp.mean(jnp.sum(errors**2, axis=-1))
     latent_mse = jnp.mean(errors**2)
     latent_rmse = jnp.sqrt(latent_mse)
-    gramian = controllability_gramian_metrics(
-        state,
-        params,
-        batch['latents'],
-        batch['actions'],
-        errors,
-        gramian_diag_eps,
-        differentiate_gramian,
-    )
-
-    latent_loss = (1.0 - alpha) * latent_l2 + alpha * gramian['gramian/energy']
+    if latent_loss_mode == 'l2':
+        # Keep the logging schema stable without paying for per-example Jacobians,
+        # eigendecompositions, or linear solves in the pure-L2 baseline.
+        alpha = jnp.asarray(0.0, dtype=latent_l2.dtype)
+        gramian = {
+            'gramian/energy': jnp.asarray(0.0, dtype=latent_l2.dtype),
+            'gramian/eig_min': jnp.asarray(0.0, dtype=latent_l2.dtype),
+            'gramian/eig_max': jnp.asarray(0.0, dtype=latent_l2.dtype),
+            'gramian/condition': jnp.asarray(0.0, dtype=latent_l2.dtype),
+        }
+        latent_loss = latent_l2
+    elif latent_loss_mode == 'gramian':
+        gramian = controllability_gramian_metrics(
+            state,
+            params,
+            batch['latents'],
+            batch['actions'],
+            errors,
+            gramian_diag_eps,
+            differentiate_gramian,
+        )
+        latent_loss = (1.0 - alpha) * latent_l2 + alpha * gramian['gramian/energy']
+    else:
+        raise ValueError(f'Unsupported latent_loss_mode {latent_loss_mode!r}.')
     loss = recon_weight * recon['mse'] + latent_weight * latent_loss
     metrics = {
         'loss': loss,
@@ -470,7 +513,7 @@ def dynamics_loss(
     return metrics
 
 
-@partial(jax.jit, static_argnames=('gramian_warmup_steps', 'differentiate_gramian'))
+@partial(jax.jit, static_argnames=('gramian_warmup_steps', 'differentiate_gramian', 'latent_loss_mode'))
 def train_step(
     state,
     ae_state,
@@ -483,6 +526,7 @@ def train_step(
     gramian_diag_eps,
     gramian_warmup_steps: int,
     differentiate_gramian: bool,
+    latent_loss_mode: str,
 ):
     """Run one latent dynamics update."""
     alpha = compute_gramian_alpha(state.step, gramian_warmup_steps)
@@ -500,6 +544,7 @@ def train_step(
             latent_weight,
             gramian_diag_eps,
             differentiate_gramian,
+            latent_loss_mode,
             deterministic=False,
             rng=rng,
         )
@@ -511,7 +556,7 @@ def train_step(
     return new_state, metrics
 
 
-@partial(jax.jit, static_argnames=('gramian_warmup_steps', 'differentiate_gramian'))
+@partial(jax.jit, static_argnames=('gramian_warmup_steps', 'differentiate_gramian', 'latent_loss_mode'))
 def eval_step(
     state,
     ae_state,
@@ -523,6 +568,7 @@ def eval_step(
     gramian_diag_eps,
     gramian_warmup_steps: int,
     differentiate_gramian: bool,
+    latent_loss_mode: str,
 ):
     """Evaluate latent dynamics without updating parameters."""
     alpha = compute_gramian_alpha(state.step, gramian_warmup_steps)
@@ -538,6 +584,7 @@ def eval_step(
         latent_weight,
         gramian_diag_eps,
         differentiate_gramian,
+        latent_loss_mode,
         deterministic=True,
     )
 
@@ -707,6 +754,7 @@ def run_training(training_config, model_config, loss_config):
                 loss_config.gramian_diag_eps,
                 loss_config.gramian_warmup_steps,
                 loss_config.differentiate_gramian,
+                loss_config.latent_loss_mode,
             )
 
             if i % training_config.log_interval == 0:
@@ -725,6 +773,7 @@ def run_training(training_config, model_config, loss_config):
                                 loss_config.gramian_diag_eps,
                                 loss_config.gramian_warmup_steps,
                                 loss_config.differentiate_gramian,
+                                loss_config.latent_loss_mode,
                             )
                         )
                         for val_batch in val_batches

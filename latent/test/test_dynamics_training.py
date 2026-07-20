@@ -75,7 +75,7 @@ def make_ae_training_config(save_dir):
     )
 
 
-def make_dynamics_model_config(latent_dim=2, action_dim=1):
+def make_dynamics_model_config(latent_dim=2, action_dim=1, prediction_type='absolute'):
     return DynamicsModelConfig(
         hidden_dims=(4,),
         latent_dim=latent_dim,
@@ -83,6 +83,7 @@ def make_dynamics_model_config(latent_dim=2, action_dim=1):
         activation='gelu',
         layer_norm=False,
         dropout_rate=0.0,
+        prediction_type=prediction_type,
     )
 
 
@@ -110,13 +111,14 @@ def make_dynamics_training_config(save_dir, ae_checkpoint_path='ae.pkl'):
     )
 
 
-def make_loss_config(gramian_warmup_steps=100000):
+def make_loss_config(gramian_warmup_steps=100000, latent_loss_mode='l2'):
     return DynamicsLossConfig(
         recon_weight=1.0,
         latent_weight=1.0,
         gramian_warmup_steps=gramian_warmup_steps,
         gramian_diag_eps=1e-3,
         differentiate_gramian=False,
+        latent_loss_mode=latent_loss_mode,
     )
 
 
@@ -146,6 +148,18 @@ class DynamicsTrainingTest(unittest.TestCase):
         predictions = model.apply({'params': params}, latents, actions)
 
         self.assertEqual(predictions.shape, (5, 3))
+
+    def test_residual_prediction_adds_network_delta(self):
+        latents = jnp.array([[0.1, -0.2, 0.3], [0.4, 0.5, -0.6]], dtype=jnp.float32)
+        actions = jnp.array([[0.2, -0.1], [0.3, 0.4]], dtype=jnp.float32)
+        absolute = LatentDynamics(hidden_dims=(4,), latent_dim=3, prediction_type='absolute')
+        params = absolute.init(jax.random.PRNGKey(0), latents, actions)['params']
+        absolute_predictions = absolute.apply({'params': params}, latents, actions)
+        residual = LatentDynamics(hidden_dims=(4,), latent_dim=3, prediction_type='residual')
+        residual_predictions = residual.apply({'params': params}, latents, actions)
+
+        self.assertEqual(residual_predictions.shape, latents.shape)
+        np.testing.assert_allclose(residual_predictions, latents + absolute_predictions, rtol=1e-6)
 
     def test_transition_dataset_validation_and_alignment(self):
         stats = NormalizationStats(
@@ -184,7 +198,38 @@ class DynamicsTrainingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_model_config(make_dynamics_model_config(latent_dim=0))
             with self.assertRaises(ValueError):
+                validate_model_config(make_dynamics_model_config(prediction_type='invalid'))
+            with self.assertRaises(ValueError):
                 validate_loss_config(DynamicsLossConfig(0.0, 0.0, 1, 1e-3, False))
+            with self.assertRaises(ValueError):
+                validate_loss_config(DynamicsLossConfig(1.0, 1.0, 1, 1e-3, False, 'invalid'))
+
+    def test_pure_l2_mode_exactly_uses_l2_and_bypasses_gramian(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ae_model_config = make_ae_model_config()
+            ae_training_config = make_ae_training_config(tmpdir)
+            ae_state = create_autoencoder_train_state(0, ae_model_config, ae_training_config)
+            dynamics_state = create_train_state(0, make_dynamics_model_config(), make_dynamics_training_config(tmpdir))
+
+            metrics = dynamics_loss(
+                dynamics_state,
+                ae_state,
+                dynamics_state.params,
+                make_batch(),
+                jnp.zeros((4,), dtype=jnp.float32),
+                jnp.ones((4,), dtype=jnp.float32),
+                alpha=1.0,
+                recon_weight=1.0,
+                latent_weight=1.0,
+                gramian_diag_eps=1e-3,
+                differentiate_gramian=False,
+                latent_loss_mode='l2',
+                deterministic=True,
+            )
+
+            np.testing.assert_array_equal(metrics['latent/loss'], metrics['latent/l2'])
+            np.testing.assert_array_equal(metrics['gramian/alpha'], 0.0)
+            np.testing.assert_array_equal(metrics['gramian/energy'], 0.0)
 
     def test_gramian_loss_is_finite_and_alpha_zero_uses_l2(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -207,6 +252,7 @@ class DynamicsTrainingTest(unittest.TestCase):
                 latent_weight=1.0,
                 gramian_diag_eps=1e-3,
                 differentiate_gramian=False,
+                latent_loss_mode='gramian',
                 deterministic=True,
             )
 
@@ -238,6 +284,7 @@ class DynamicsTrainingTest(unittest.TestCase):
                 loss_config.gramian_diag_eps,
                 loss_config.gramian_warmup_steps,
                 loss_config.differentiate_gramian,
+                loss_config.latent_loss_mode,
             )
             eval_metrics = eval_step(
                 new_state,
@@ -250,6 +297,7 @@ class DynamicsTrainingTest(unittest.TestCase):
                 loss_config.gramian_diag_eps,
                 loss_config.gramian_warmup_steps,
                 loss_config.differentiate_gramian,
+                loss_config.latent_loss_mode,
             )
 
             self.assertEqual(new_state.step, dynamics_state.step + 1)
@@ -278,6 +326,7 @@ class DynamicsTrainingTest(unittest.TestCase):
             self.assertEqual(checkpoint['latent_dim'], dynamics_model_config.latent_dim)
             self.assertEqual(checkpoint['action_dim'], dynamics_model_config.action_dim)
             self.assertFalse(checkpoint['loss_config']['differentiate_gramian'])
+            self.assertEqual(checkpoint['loss_config']['latent_loss_mode'], 'l2')
 
             restored_state, restored_step = restore_checkpoint(dynamics_state, str(checkpoint_path), None)
             self.assertEqual(restored_step, 2)
