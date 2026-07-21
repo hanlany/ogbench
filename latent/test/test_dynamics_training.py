@@ -111,7 +111,12 @@ def make_dynamics_training_config(save_dir, ae_checkpoint_path='ae.pkl'):
     )
 
 
-def make_loss_config(gramian_warmup_steps=100000, latent_loss_mode='l2'):
+def make_loss_config(
+    gramian_warmup_steps=100000,
+    latent_loss_mode='l2',
+    xy_weight=0.0,
+    xy_tolerance=1.0,
+):
     return DynamicsLossConfig(
         recon_weight=1.0,
         latent_weight=1.0,
@@ -119,6 +124,8 @@ def make_loss_config(gramian_warmup_steps=100000, latent_loss_mode='l2'):
         gramian_diag_eps=1e-3,
         differentiate_gramian=False,
         latent_loss_mode=latent_loss_mode,
+        xy_weight=xy_weight,
+        xy_tolerance=xy_tolerance,
     )
 
 
@@ -203,6 +210,11 @@ class DynamicsTrainingTest(unittest.TestCase):
                 validate_loss_config(DynamicsLossConfig(0.0, 0.0, 1, 1e-3, False))
             with self.assertRaises(ValueError):
                 validate_loss_config(DynamicsLossConfig(1.0, 1.0, 1, 1e-3, False, 'invalid'))
+            with self.assertRaises(ValueError):
+                validate_loss_config(make_loss_config(xy_weight=-1.0))
+            with self.assertRaises(ValueError):
+                validate_loss_config(make_loss_config(xy_tolerance=0.0))
+            validate_loss_config(DynamicsLossConfig(0.0, 0.0, 1, 1e-3, False, xy_weight=1.0))
 
     def test_pure_l2_mode_exactly_uses_l2_and_bypasses_gramian(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -221,6 +233,8 @@ class DynamicsTrainingTest(unittest.TestCase):
                 alpha=1.0,
                 recon_weight=1.0,
                 latent_weight=1.0,
+                xy_weight=0.0,
+                xy_tolerance=1.0,
                 gramian_diag_eps=1e-3,
                 differentiate_gramian=False,
                 latent_loss_mode='l2',
@@ -230,6 +244,47 @@ class DynamicsTrainingTest(unittest.TestCase):
             np.testing.assert_array_equal(metrics['latent/loss'], metrics['latent/l2'])
             np.testing.assert_array_equal(metrics['gramian/alpha'], 0.0)
             np.testing.assert_array_equal(metrics['gramian/energy'], 0.0)
+
+    def test_xy_loss_uses_original_units_and_zero_weight_preserves_loss(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ae_model_config = make_ae_model_config()
+            ae_training_config = make_ae_training_config(tmpdir)
+            ae_state = create_autoencoder_train_state(0, ae_model_config, ae_training_config)
+            dynamics_state = create_train_state(0, make_dynamics_model_config(), make_dynamics_training_config(tmpdir))
+            batch = make_batch()
+            mean = jnp.array([10.0, -5.0, 2.0, 3.0], dtype=jnp.float32)
+            std = jnp.array([2.0, 4.0, 0.5, 0.25], dtype=jnp.float32)
+
+            def metrics(xy_weight, xy_tolerance):
+                return dynamics_loss(
+                    dynamics_state,
+                    ae_state,
+                    dynamics_state.params,
+                    batch,
+                    mean,
+                    std,
+                    alpha=1.0,
+                    recon_weight=1.0,
+                    latent_weight=1.0,
+                    xy_weight=xy_weight,
+                    xy_tolerance=xy_tolerance,
+                    gramian_diag_eps=1e-3,
+                    differentiate_gramian=False,
+                    latent_loss_mode='l2',
+                    deterministic=True,
+                )
+
+            base = metrics(xy_weight=0.0, xy_tolerance=1.0)
+            tolerance_two = metrics(xy_weight=0.0, xy_tolerance=2.0)
+            weighted = metrics(xy_weight=5.0, xy_tolerance=2.0)
+
+            np.testing.assert_array_equal(base['loss'], base['recon/mse'] + base['latent/loss'])
+            np.testing.assert_allclose(base['xy/loss'], 4.0 * tolerance_two['xy/loss'], rtol=1e-6)
+            np.testing.assert_allclose(
+                weighted['loss'],
+                tolerance_two['loss'] + 5.0 * tolerance_two['xy/loss'],
+                rtol=1e-6,
+            )
 
     def test_gramian_loss_is_finite_and_alpha_zero_uses_l2(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -250,6 +305,8 @@ class DynamicsTrainingTest(unittest.TestCase):
                 alpha=0.0,
                 recon_weight=1.0,
                 latent_weight=1.0,
+                xy_weight=0.0,
+                xy_tolerance=1.0,
                 gramian_diag_eps=1e-3,
                 differentiate_gramian=False,
                 latent_loss_mode='gramian',
@@ -281,6 +338,8 @@ class DynamicsTrainingTest(unittest.TestCase):
                 jax.random.PRNGKey(1),
                 loss_config.recon_weight,
                 loss_config.latent_weight,
+                loss_config.xy_weight,
+                loss_config.xy_tolerance,
                 loss_config.gramian_diag_eps,
                 loss_config.gramian_warmup_steps,
                 loss_config.differentiate_gramian,
@@ -294,6 +353,8 @@ class DynamicsTrainingTest(unittest.TestCase):
                 std,
                 loss_config.recon_weight,
                 loss_config.latent_weight,
+                loss_config.xy_weight,
+                loss_config.xy_tolerance,
                 loss_config.gramian_diag_eps,
                 loss_config.gramian_warmup_steps,
                 loss_config.differentiate_gramian,
@@ -327,6 +388,8 @@ class DynamicsTrainingTest(unittest.TestCase):
             self.assertEqual(checkpoint['action_dim'], dynamics_model_config.action_dim)
             self.assertFalse(checkpoint['loss_config']['differentiate_gramian'])
             self.assertEqual(checkpoint['loss_config']['latent_loss_mode'], 'l2')
+            self.assertEqual(checkpoint['loss_config']['xy_weight'], 0.0)
+            self.assertEqual(checkpoint['loss_config']['xy_tolerance'], 1.0)
 
             restored_state, restored_step = restore_checkpoint(dynamics_state, str(checkpoint_path), None)
             self.assertEqual(restored_step, 2)

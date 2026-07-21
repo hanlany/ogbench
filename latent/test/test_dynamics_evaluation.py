@@ -244,7 +244,6 @@ class DynamicsEvaluationTest(unittest.TestCase):
             legacy_artifacts = load_dynamics_artifacts(legacy_path)
             self.assertEqual(legacy_artifacts.model_config.prediction_type, 'absolute')
 
-
     def test_checkpoint_validation_and_end_to_end_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

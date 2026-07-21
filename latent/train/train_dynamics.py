@@ -109,6 +109,13 @@ flags.DEFINE_integer(
 
 flags.DEFINE_float('recon_weight', 1.0, 'Weight for decoded next-observation reconstruction loss.', **_FLAG_KWARGS)
 flags.DEFINE_float('latent_weight', 1.0, 'Weight for latent prediction loss.', **_FLAG_KWARGS)
+flags.DEFINE_float('xy_weight', 0.0, 'Weight for decoded next-position loss in original units.', **_FLAG_KWARGS)
+flags.DEFINE_float(
+    'xy_tolerance',
+    1.0,
+    'Original-unit position tolerance used to scale the decoded XY loss.',
+    **_FLAG_KWARGS,
+)
 flags.DEFINE_enum(
     'latent_loss_mode',
     'l2',
@@ -175,6 +182,8 @@ class DynamicsLossConfig:
     gramian_diag_eps: float
     differentiate_gramian: bool
     latent_loss_mode: str = 'l2'
+    xy_weight: float = 0.0
+    xy_tolerance: float = 1.0
 
 
 def create_configs(latent_dim=-1, action_dim=-1):
@@ -217,6 +226,8 @@ def create_configs(latent_dim=-1, action_dim=-1):
         gramian_diag_eps=FLAGS.gramian_diag_eps,
         differentiate_gramian=FLAGS.differentiate_gramian,
         latent_loss_mode=FLAGS.latent_loss_mode,
+        xy_weight=FLAGS.xy_weight,
+        xy_tolerance=FLAGS.xy_tolerance,
     )
     return training_config, model_config, loss_config
 
@@ -262,8 +273,12 @@ def validate_loss_config(config: DynamicsLossConfig):
         raise ValueError(f'recon_weight must be non-negative, got {config.recon_weight}.')
     if config.latent_weight < 0:
         raise ValueError(f'latent_weight must be non-negative, got {config.latent_weight}.')
-    if config.recon_weight == 0 and config.latent_weight == 0:
-        raise ValueError('At least one of recon_weight or latent_weight must be positive.')
+    if config.xy_weight < 0:
+        raise ValueError(f'xy_weight must be non-negative, got {config.xy_weight}.')
+    if config.xy_tolerance <= 0:
+        raise ValueError(f'xy_tolerance must be positive, got {config.xy_tolerance}.')
+    if config.recon_weight == 0 and config.latent_weight == 0 and config.xy_weight == 0:
+        raise ValueError('At least one of recon_weight, latent_weight, or xy_weight must be positive.')
     if config.latent_loss_mode not in ('l2', 'gramian'):
         raise ValueError(f'latent_loss_mode must be one of (l2, gramian), got {config.latent_loss_mode!r}.')
     if config.gramian_warmup_steps < 0:
@@ -447,6 +462,8 @@ def dynamics_loss(
     alpha,
     recon_weight,
     latent_weight,
+    xy_weight,
+    xy_tolerance,
     gramian_diag_eps,
     differentiate_gramian,
     latent_loss_mode,
@@ -467,6 +484,9 @@ def dynamics_loss(
     recon = reconstruction_metrics(batch['next_observations'], pred_next_observations)
     raw_pred_next_observations = pred_next_observations * std + mean
     raw_recon = reconstruction_metrics(batch['raw_next_observations'], raw_pred_next_observations)
+    raw_xy_errors = raw_pred_next_observations[..., :2] - batch['raw_next_observations'][..., :2]
+    xy_mse = jnp.mean(raw_xy_errors**2)
+    xy_loss = xy_mse / jnp.asarray(xy_tolerance, dtype=xy_mse.dtype) ** 2
 
     errors = batch['next_latents'] - pred_latents
     latent_l2 = jnp.mean(jnp.sum(errors**2, axis=-1))
@@ -496,7 +516,7 @@ def dynamics_loss(
         latent_loss = (1.0 - alpha) * latent_l2 + alpha * gramian['gramian/energy']
     else:
         raise ValueError(f'Unsupported latent_loss_mode {latent_loss_mode!r}.')
-    loss = recon_weight * recon['mse'] + latent_weight * latent_loss
+    loss = recon_weight * recon['mse'] + latent_weight * latent_loss + xy_weight * xy_loss
     metrics = {
         'loss': loss,
         'latent/loss': latent_loss,
@@ -505,6 +525,10 @@ def dynamics_loss(
         'latent/rmse': latent_rmse,
         'latent/error_norm': jnp.mean(jnp.linalg.norm(errors, axis=-1)),
         'latent/pred_norm': jnp.mean(jnp.linalg.norm(pred_latents, axis=-1)),
+        'xy/loss': xy_loss,
+        'xy/mse': xy_mse,
+        'xy/rmse': jnp.sqrt(xy_mse),
+        'xy/mean_error': jnp.mean(jnp.linalg.norm(raw_xy_errors, axis=-1)),
         'gramian/alpha': alpha,
     }
     metrics.update({f'recon/{key}': value for key, value in recon.items()})
@@ -523,6 +547,8 @@ def train_step(
     rng,
     recon_weight,
     latent_weight,
+    xy_weight,
+    xy_tolerance,
     gramian_diag_eps,
     gramian_warmup_steps: int,
     differentiate_gramian: bool,
@@ -542,6 +568,8 @@ def train_step(
             alpha,
             recon_weight,
             latent_weight,
+            xy_weight,
+            xy_tolerance,
             gramian_diag_eps,
             differentiate_gramian,
             latent_loss_mode,
@@ -565,6 +593,8 @@ def eval_step(
     std,
     recon_weight,
     latent_weight,
+    xy_weight,
+    xy_tolerance,
     gramian_diag_eps,
     gramian_warmup_steps: int,
     differentiate_gramian: bool,
@@ -582,6 +612,8 @@ def eval_step(
         alpha,
         recon_weight,
         latent_weight,
+        xy_weight,
+        xy_tolerance,
         gramian_diag_eps,
         differentiate_gramian,
         latent_loss_mode,
@@ -751,6 +783,8 @@ def run_training(training_config, model_config, loss_config):
                 step_rng,
                 loss_config.recon_weight,
                 loss_config.latent_weight,
+                loss_config.xy_weight,
+                loss_config.xy_tolerance,
                 loss_config.gramian_diag_eps,
                 loss_config.gramian_warmup_steps,
                 loss_config.differentiate_gramian,
@@ -770,6 +804,8 @@ def run_training(training_config, model_config, loss_config):
                                 std,
                                 loss_config.recon_weight,
                                 loss_config.latent_weight,
+                                loss_config.xy_weight,
+                                loss_config.xy_tolerance,
                                 loss_config.gramian_diag_eps,
                                 loss_config.gramian_warmup_steps,
                                 loss_config.differentiate_gramian,
