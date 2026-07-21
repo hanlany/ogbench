@@ -191,6 +191,32 @@ class DynamicsEvaluationTest(unittest.TestCase):
         np.testing.assert_array_equal(first['start_indices'], second['start_indices'])
         np.testing.assert_array_equal(np.bincount(first['episode_ids']), [2, 2])
 
+    def test_window_sampling_applies_deterministic_total_cap(self):
+        observations = np.arange(60, dtype=np.float32).reshape(30, 2)
+        dataset = {
+            'observations': observations,
+            'actions': np.zeros((30, 1), dtype=np.float32),
+            'terminals': np.array(([0] * 9 + [1]) * 3, dtype=np.float32),
+        }
+        first = build_rollout_windows(
+            dataset,
+            max_horizon=2,
+            rollouts_per_episode=0,
+            seed=7,
+            max_rollouts=5,
+        )
+        second = build_rollout_windows(
+            dataset,
+            max_horizon=2,
+            rollouts_per_episode=0,
+            seed=7,
+            max_rollouts=5,
+        )
+        self.assertEqual(len(first['start_indices']), 5)
+        np.testing.assert_array_equal(first['start_indices'], second['start_indices'])
+        with self.assertRaisesRegex(ValueError, 'max_rollouts must be positive'):
+            build_rollout_windows(dataset, max_horizon=2, rollouts_per_episode=0, seed=7, max_rollouts=0)
+
     def test_recursive_and_teacher_forced_rollouts(self):
         initial = jnp.array([[0.0]], dtype=jnp.float32)
         actions = jnp.ones((1, 3, 1), dtype=jnp.float32)
@@ -266,12 +292,17 @@ class DynamicsEvaluationTest(unittest.TestCase):
                 output_dir,
                 horizons=(1, 2),
                 rollouts_per_episode=1,
+                max_rollouts=1,
                 batch_size=2,
                 seed=3,
                 num_plot_rollouts=2,
+                evaluation_env_name='dummy-explore-v0',
             )
 
-            self.assertEqual(metrics['settings']['num_rollouts'], 2)
+            self.assertEqual(metrics['settings']['num_rollouts'], 1)
+            self.assertEqual(metrics['settings']['max_rollouts'], 1)
+            self.assertEqual(metrics['environment'], 'dummy-explore-v0')
+            self.assertEqual(metrics['training_environment'], 'dummy-v0')
             self.assertEqual(set(metrics['methods']), {'open_loop', 'teacher_forced', 'ae_floor', 'persistence'})
             self.assertTrue((output_dir / 'metrics.json').is_file())
             self.assertTrue((output_dir / 'summary.txt').is_file())

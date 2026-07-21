@@ -162,12 +162,15 @@ def build_rollout_windows(
     max_horizon: int,
     rollouts_per_episode: int,
     seed: int,
+    max_rollouts: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Build balanced, deterministic windows that stay inside recorded episodes."""
     if max_horizon <= 0:
         raise ValueError('max_horizon must be positive.')
     if rollouts_per_episode < 0:
         raise ValueError('rollouts_per_episode must be non-negative.')
+    if max_rollouts is not None and max_rollouts <= 0:
+        raise ValueError('max_rollouts must be positive when provided.')
     for key in ('observations', 'actions', 'terminals'):
         if key not in raw_dataset:
             raise ValueError(f'Validation dataset is missing required key {key!r}.')
@@ -194,6 +197,11 @@ def build_rollout_windows(
         episode_ids.extend([episode_id] * len(candidates))
     if not selected_starts:
         raise ValueError(f'No episodes are long enough for max_horizon={max_horizon}.')
+
+    if max_rollouts is not None and len(selected_starts) > max_rollouts:
+        selected = np.sort(rng.choice(len(selected_starts), size=max_rollouts, replace=False))
+        selected_starts = [selected_starts[index] for index in selected]
+        episode_ids = [episode_ids[index] for index in selected]
 
     starts = np.asarray(selected_starts, dtype=np.int64)
     action_offsets = np.arange(max_horizon, dtype=np.int64)
@@ -508,16 +516,24 @@ def evaluate_rollout_dataset(
     output_dir: str | Path,
     horizons: tuple[int, ...] = DEFAULT_HORIZONS,
     rollouts_per_episode: int = 100,
+    max_rollouts: int | None = None,
     batch_size: int = 1024,
     seed: int | None = None,
     num_plot_rollouts: int = 8,
     write_plots: bool = True,
+    evaluation_env_name: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate a dynamics checkpoint on an already-loaded compact validation dataset."""
     horizons = parse_horizons(horizons)
     artifacts = load_dynamics_artifacts(checkpoint_path)
     seed = artifacts.seed if seed is None else seed
-    windows = build_rollout_windows(raw_dataset, max(horizons), rollouts_per_episode, seed)
+    windows = build_rollout_windows(
+        raw_dataset,
+        max(horizons),
+        rollouts_per_episode,
+        seed,
+        max_rollouts=max_rollouts,
+    )
     if windows['actions'].shape[-1] != artifacts.model_config.action_dim:
         raise ValueError(
             f'Action dimension mismatch: dataset={windows["actions"].shape[-1]}, '
@@ -574,12 +590,14 @@ def evaluate_rollout_dataset(
         'checkpoint_path': str(artifacts.checkpoint_path),
         'checkpoint_step': int(artifacts.checkpoint.get('step', -1)),
         'ae_checkpoint_path': str(artifacts.ae_checkpoint_path),
-        'environment': artifacts.env_name,
+        'environment': evaluation_env_name or artifacts.env_name,
+        'training_environment': artifacts.env_name,
         'model_config': artifacts.checkpoint['model_config'],
         'settings': {
             'horizons': list(horizons),
             'max_horizon': max(horizons),
             'rollouts_per_episode': rollouts_per_episode,
+            'max_rollouts': max_rollouts,
             'num_rollouts': len(raw_initial),
             'batch_size': batch_size,
             'seed': seed,
@@ -612,10 +630,13 @@ def load_validation_dataset(
     dataset_path: str | None = None,
 ) -> dict[str, np.ndarray]:
     """Load the compact held-out split while preserving episode boundary fields."""
+    evaluation_env_name = env_name or artifacts.env_name
+    if dataset_path is None and evaluation_env_name == artifacts.env_name:
+        dataset_path = artifacts.dataset_path
     _, validation = make_env_and_datasets(
-        env_name or artifacts.env_name,
+        evaluation_env_name,
         dataset_dir=dataset_dir or artifacts.dataset_dir,
-        dataset_path=dataset_path if dataset_path is not None else artifacts.dataset_path,
+        dataset_path=dataset_path,
         compact_dataset=True,
         dataset_only=True,
     )
@@ -629,6 +650,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--checkpoint_path', required=True, help='Path to a dynamics params_<step>.pkl checkpoint.')
     parser.add_argument('--horizons', default='1,5,10,25', help='Comma-separated positive rollout horizons.')
     parser.add_argument('--rollouts_per_episode', type=int, default=100, help='Starts per episode; 0 uses all starts.')
+    parser.add_argument('--max_rollouts', type=int, default=None, help='Optional deterministic cap on total windows.')
     parser.add_argument('--batch_size', type=int, default=1024, help='Inference batch size.')
     parser.add_argument('--seed', type=int, default=None, help='Sampling seed; defaults to the checkpoint seed.')
     parser.add_argument('--env_name', default=None, help='Override the checkpoint environment name.')
@@ -655,9 +677,11 @@ def main(argv=None):
         output_dir,
         horizons=parse_horizons(args.horizons),
         rollouts_per_episode=args.rollouts_per_episode,
+        max_rollouts=args.max_rollouts,
         batch_size=args.batch_size,
         seed=args.seed,
         num_plot_rollouts=args.num_plot_rollouts,
+        evaluation_env_name=args.env_name or artifacts.env_name,
     )
     print(f'Wrote dynamics rollout evaluation to {output_dir}')
 
