@@ -106,6 +106,24 @@ flags.DEFINE_integer(
     'Batch size for offline AE encoding before dynamics training.',
     **_FLAG_KWARGS,
 )
+flags.DEFINE_list(
+    'rollout_horizons',
+    ['1'],
+    'Recursive training horizons. A single horizon 1 preserves one-step training.',
+    **_FLAG_KWARGS,
+)
+flags.DEFINE_integer(
+    'rollout_horizon1_steps',
+    0,
+    'Curriculum steps restricted to horizon 1 before the horizon-5 phase.',
+    **_FLAG_KWARGS,
+)
+flags.DEFINE_integer(
+    'rollout_horizon5_steps',
+    0,
+    'End step of the horizon-5 curriculum phase; later steps sample rollout_horizons.',
+    **_FLAG_KWARGS,
+)
 
 flags.DEFINE_float('recon_weight', 1.0, 'Weight for decoded next-observation reconstruction loss.', **_FLAG_KWARGS)
 flags.DEFINE_float('latent_weight', 1.0, 'Weight for latent prediction loss.', **_FLAG_KWARGS)
@@ -172,6 +190,9 @@ class DynamicsTrainingConfig:
     validation_batches: int
     validation_batch_size: int
     encoder_batch_size: int
+    rollout_horizons: tuple[int, ...] = (1,)
+    rollout_horizon1_steps: int = 0
+    rollout_horizon5_steps: int = 0
 
 
 @dataclass(frozen=True)
@@ -209,6 +230,9 @@ def create_configs(latent_dim=-1, action_dim=-1):
         validation_batches=FLAGS.validation_batches,
         validation_batch_size=validation_batch_size,
         encoder_batch_size=FLAGS.encoder_batch_size,
+        rollout_horizons=parse_dims(FLAGS.rollout_horizons, 'rollout_horizons'),
+        rollout_horizon1_steps=FLAGS.rollout_horizon1_steps,
+        rollout_horizon5_steps=FLAGS.rollout_horizon5_steps,
     )
     model_config = DynamicsModelConfig(
         hidden_dims=parse_dims(FLAGS.hidden_dims, 'hidden_dims'),
@@ -253,6 +277,26 @@ def validate_training_config(config: DynamicsTrainingConfig):
         raise ValueError(f'prefetch_batches must be non-negative, got {config.prefetch_batches}.')
     if config.lr <= 0:
         raise ValueError(f'lr must be positive, got {config.lr}.')
+    if not config.rollout_horizons:
+        raise ValueError('rollout_horizons must not be empty.')
+    if tuple(sorted(set(config.rollout_horizons))) != config.rollout_horizons:
+        raise ValueError(f'rollout_horizons must be strictly increasing and unique, got {config.rollout_horizons}.')
+    if config.rollout_horizons[0] != 1:
+        raise ValueError(f'rollout_horizons must begin with 1, got {config.rollout_horizons}.')
+    if config.rollout_horizon1_steps < 0:
+        raise ValueError(f'rollout_horizon1_steps must be non-negative, got {config.rollout_horizon1_steps}.')
+    if config.rollout_horizon5_steps < config.rollout_horizon1_steps:
+        raise ValueError(
+            'rollout_horizon5_steps must be greater than or equal to rollout_horizon1_steps, got '
+            f'{config.rollout_horizon5_steps} < {config.rollout_horizon1_steps}.'
+        )
+    if config.rollout_horizon5_steps > config.train_steps:
+        raise ValueError(
+            f'rollout_horizon5_steps must not exceed train_steps, got '
+            f'{config.rollout_horizon5_steps} > {config.train_steps}.'
+        )
+    if config.rollout_horizon5_steps > config.rollout_horizon1_steps and 5 not in config.rollout_horizons:
+        raise ValueError('rollout_horizons must contain 5 when the horizon-5 curriculum phase is enabled.')
 
 
 def validate_model_config(config: DynamicsModelConfig):
@@ -326,12 +370,21 @@ def make_transition_dataset(raw_dataset, stats: NormalizationStats, split_name: 
             f'got mean={stats.mean.shape}, std={stats.std.shape}.'
         )
 
-    return Dataset.create(
+    fields = dict(
         observations=normalize_observations(raw_observations, stats),
         actions=actions,
         next_observations=normalize_observations(raw_next_observations, stats),
         raw_next_observations=raw_next_observations,
     )
+    if 'terminals' in raw_dataset:
+        terminals = np.asarray(raw_dataset['terminals'], dtype=np.float32).reshape(-1)
+        if len(terminals) != len(raw_observations):
+            raise ValueError(
+                f'Expected aligned {split_name} terminals, got terminals={len(terminals)} and '
+                f'observations={len(raw_observations)}.'
+            )
+        fields['terminals'] = terminals
+    return Dataset.create(**fields)
 
 
 def load_transition_datasets(config: DynamicsTrainingConfig, stats: NormalizationStats):
@@ -363,7 +416,7 @@ def encode_transition_dataset(dataset, ae_state, batch_size: int):
     """Cache normalized transitions in latent space for dynamics training."""
     latents = predict_latents(ae_state, dataset['observations'], batch_size)
     next_latents = predict_latents(ae_state, dataset['next_observations'], batch_size)
-    return Dataset.create(
+    fields = dict(
         observations=latents,
         latents=latents,
         actions=np.asarray(dataset['actions'], dtype=np.float32),
@@ -371,6 +424,64 @@ def encode_transition_dataset(dataset, ae_state, batch_size: int):
         next_latents=next_latents,
         raw_next_observations=np.asarray(dataset['raw_next_observations'], dtype=np.float32),
     )
+    if 'terminals' in dataset:
+        fields['terminals'] = np.asarray(dataset['terminals'], dtype=np.float32)
+    return Dataset.create(**fields)
+
+
+class RolloutDataset:
+    """Indexed episode-safe recursive rollout views over encoded transitions."""
+
+    def __init__(self, dataset, horizon: int):
+        if horizon <= 0:
+            raise ValueError(f'horizon must be positive, got {horizon}.')
+        if 'terminals' not in dataset:
+            raise ValueError('Rollout training requires terminal markers.')
+        terminals = np.asarray(dataset['terminals']).reshape(-1)
+        ends = np.flatnonzero(terminals > 0) + 1
+        if len(ends) == 0 or ends[-1] != dataset.size:
+            raise ValueError('Rollout training data must mark the final transition as terminal.')
+        starts = np.concatenate([[0], ends[:-1]])
+        candidates = [np.arange(start, end - horizon + 1, dtype=np.int64) for start, end in zip(starts, ends)]
+        candidates = [indices for indices in candidates if len(indices) > 0]
+        if not candidates:
+            raise ValueError(f'No episodes are long enough for rollout horizon {horizon}.')
+
+        self.dataset = dataset
+        self.horizon = horizon
+        self.valid_starts = np.concatenate(candidates)
+        self.size = len(self.valid_starts)
+
+    def get_subset(self, idxs):
+        """Gather rollout windows using positions within valid_starts."""
+        starts = self.valid_starts[np.asarray(idxs)]
+        offsets = np.arange(self.horizon, dtype=np.int64)
+        indices = starts[:, None] + offsets[None, :]
+        return {
+            'latents': self.dataset['latents'][starts],
+            'actions': self.dataset['actions'][indices],
+            'next_latents': self.dataset['next_latents'][indices],
+            'next_observations': self.dataset['next_observations'][indices],
+            'raw_next_observations': self.dataset['raw_next_observations'][indices],
+        }
+
+    def sample(self, batch_size, idxs=None):
+        """Sample episode-safe rollout windows."""
+        if idxs is None:
+            idxs = np.random.randint(self.size, size=batch_size)
+        return self.get_subset(idxs)
+
+
+def rollout_horizon_for_step(step: int, config: DynamicsTrainingConfig) -> int:
+    """Select the deterministic curriculum horizon for a training step."""
+    if len(config.rollout_horizons) == 1:
+        return config.rollout_horizons[0]
+    if step <= config.rollout_horizon1_steps:
+        return 1
+    if step <= config.rollout_horizon5_steps:
+        return 5
+    rng = np.random.default_rng(config.seed + step)
+    return int(rng.choice(config.rollout_horizons))
 
 
 def create_train_state(seed, model_config: DynamicsModelConfig, training_config: DynamicsTrainingConfig):
@@ -405,6 +516,43 @@ def apply_dynamics(state, params, latents, actions, deterministic: bool, rng=Non
     if rng is None:
         return state(latents, actions, params=params, deterministic=deterministic)
     return state(latents, actions, params=params, deterministic=deterministic, rngs={'dropout': rng})
+
+
+def apply_dynamics_rollout(state, params, initial_latents, actions, deterministic: bool, rng=None):
+    """Recursively propagate predicted latents without teacher forcing."""
+    time_major_actions = jnp.swapaxes(actions, 0, 1)
+    if rng is None:
+        step_rngs = None
+    else:
+        step_rngs = jax.random.split(rng, actions.shape[1])
+
+    def deterministic_step(latents, step_actions):
+        next_latents = apply_dynamics(
+            state,
+            params,
+            latents,
+            step_actions,
+            deterministic=deterministic,
+        )
+        return next_latents, next_latents
+
+    def stochastic_step(latents, inputs):
+        step_actions, step_rng = inputs
+        next_latents = apply_dynamics(
+            state,
+            params,
+            latents,
+            step_actions,
+            deterministic=deterministic,
+            rng=step_rng,
+        )
+        return next_latents, next_latents
+
+    if step_rngs is None:
+        _, predictions = jax.lax.scan(deterministic_step, initial_latents, time_major_actions)
+    else:
+        _, predictions = jax.lax.scan(stochastic_step, initial_latents, (time_major_actions, step_rngs))
+    return jnp.swapaxes(predictions, 0, 1)
 
 
 def controllability_gramian_metrics(
@@ -471,14 +619,29 @@ def dynamics_loss(
     rng=None,
 ):
     """Compute dynamics loss and scalar diagnostics."""
-    pred_latents = apply_dynamics(
-        state,
-        params,
-        batch['latents'],
-        batch['actions'],
-        deterministic=deterministic,
-        rng=rng,
-    )
+    is_rollout = batch['actions'].ndim == 3
+    if is_rollout:
+        if latent_loss_mode != 'l2':
+            raise ValueError('Recursive rollout training currently supports latent_loss_mode=l2 only.')
+        pred_latents = apply_dynamics_rollout(
+            state,
+            params,
+            batch['latents'],
+            batch['actions'],
+            deterministic=deterministic,
+            rng=rng,
+        )
+        rollout_horizon = batch['actions'].shape[1]
+    else:
+        pred_latents = apply_dynamics(
+            state,
+            params,
+            batch['latents'],
+            batch['actions'],
+            deterministic=deterministic,
+            rng=rng,
+        )
+        rollout_horizon = 1
     pred_next_observations = ae_state(pred_latents, method='decode', deterministic=True)
 
     recon = reconstruction_metrics(batch['next_observations'], pred_next_observations)
@@ -529,6 +692,7 @@ def dynamics_loss(
         'xy/mse': xy_mse,
         'xy/rmse': jnp.sqrt(xy_mse),
         'xy/mean_error': jnp.mean(jnp.linalg.norm(raw_xy_errors, axis=-1)),
+        'rollout/horizon': jnp.asarray(rollout_horizon, dtype=latent_l2.dtype),
         'gramian/alpha': alpha,
     }
     metrics.update({f'recon/{key}': value for key, value in recon.items()})
@@ -671,13 +835,56 @@ def resolve_checkpoint_path(restore_path, restore_step):
     return path / f'params_{restore_step}.pkl'
 
 
-def restore_checkpoint(state, restore_path, restore_step):
-    """Restore a dynamics train state from a checkpoint."""
+def restore_checkpoint(
+    state,
+    restore_path,
+    restore_step,
+    training_config=None,
+    model_config=None,
+    loss_config=None,
+):
+    """Restore a dynamics state and reject incompatible objective/curriculum settings."""
     checkpoint_path = resolve_checkpoint_path(restore_path, restore_step)
     with checkpoint_path.open('rb') as f:
         checkpoint = pickle.load(f)
     if 'dynamics' not in checkpoint:
         raise ValueError(f'Checkpoint {checkpoint_path} does not contain a dynamics train state.')
+
+    expected_sections = {
+        'training_config': (
+            training_config,
+            {
+                'rollout_horizons': (1,),
+                'rollout_horizon1_steps': 0,
+                'rollout_horizon5_steps': 0,
+            },
+        ),
+        'model_config': (model_config, {'prediction_type': 'absolute'}),
+        'loss_config': (
+            loss_config,
+            {
+                'latent_loss_mode': 'gramian',
+                'xy_weight': 0.0,
+                'xy_tolerance': 1.0,
+            },
+        ),
+    }
+    for section, (expected_config, defaults) in expected_sections.items():
+        if expected_config is None:
+            continue
+        saved_config = checkpoint.get(section, {})
+        for key, default in defaults.items():
+            saved_value = saved_config.get(key, default)
+            expected_value = getattr(expected_config, key)
+            if key == 'rollout_horizons':
+                saved_value = tuple(saved_value)
+                expected_value = tuple(expected_value)
+            if saved_value != expected_value:
+                raise ValueError(
+                    f'Restore configuration mismatch for {section}.{key}: '
+                    f'checkpoint={saved_value!r}, requested={expected_value!r}.'
+                )
+
     state = flax.serialization.from_state_dict(state, checkpoint['dynamics'])
     restored_step = checkpoint.get('step', restore_step)
     print(f'Restored from {checkpoint_path}')
@@ -708,6 +915,8 @@ def run_training(training_config, model_config, loss_config):
     """Run the full latent dynamics training workflow."""
     validate_training_config(training_config)
     validate_loss_config(loss_config)
+    if training_config.rollout_horizons != (1,) and loss_config.latent_loss_mode != 'l2':
+        raise ValueError('Recursive rollout training currently supports latent_loss_mode=l2 only.')
 
     random.seed(training_config.seed)
     np.random.seed(training_config.seed)
@@ -748,23 +957,63 @@ def run_training(training_config, model_config, loss_config):
     state = create_train_state(training_config.seed, model_config, training_config)
     start_step = 1
     if training_config.restore_path is not None:
-        state, restored_step = restore_checkpoint(state, training_config.restore_path, training_config.restore_step)
+        state, restored_step = restore_checkpoint(
+            state,
+            training_config.restore_path,
+            training_config.restore_step,
+            training_config=training_config,
+            model_config=model_config,
+            loss_config=loss_config,
+        )
         start_step = int(restored_step) + 1
 
-    val_batches = create_validation_batches(
-        val_dataset,
-        training_config.validation_batch_size,
-        training_config.validation_batches,
-        training_config.seed + 1,
-    )
+    rollout_training = training_config.rollout_horizons != (1,)
     mean = jnp.asarray(normalization_stats.mean)
     std = jnp.asarray(normalization_stats.std)
+    prefetchers = []
 
-    prefetcher, sample_train_batch = create_batch_sampler(
-        train_dataset,
-        training_config.batch_size,
-        training_config.prefetch_batches,
-    )
+    if rollout_training:
+        train_rollouts = {
+            horizon: RolloutDataset(train_dataset, horizon) for horizon in training_config.rollout_horizons
+        }
+        val_rollouts = (
+            {horizon: RolloutDataset(val_dataset, horizon) for horizon in training_config.rollout_horizons}
+            if val_dataset is not None
+            else {}
+        )
+        sample_train_batches = {}
+        for horizon, rollout_dataset in train_rollouts.items():
+            prefetcher, sampler = create_batch_sampler(
+                rollout_dataset,
+                training_config.batch_size,
+                training_config.prefetch_batches,
+            )
+            if prefetcher is not None:
+                prefetchers.append(prefetcher)
+            sample_train_batches[horizon] = sampler
+        val_batches = {
+            horizon: create_validation_batches(
+                rollout_dataset,
+                training_config.validation_batch_size,
+                training_config.validation_batches,
+                training_config.seed + 1,
+            )
+            for horizon, rollout_dataset in val_rollouts.items()
+        }
+    else:
+        val_batches = create_validation_batches(
+            val_dataset,
+            training_config.validation_batch_size,
+            training_config.validation_batches,
+            training_config.seed + 1,
+        )
+        prefetcher, sample_train_batch = create_batch_sampler(
+            train_dataset,
+            training_config.batch_size,
+            training_config.prefetch_batches,
+        )
+        if prefetcher is not None:
+            prefetchers.append(prefetcher)
     train_logger = CsvLogger(os.path.join(training_config.save_dir, 'train.csv'))
     rng = jax.random.PRNGKey(training_config.seed + 1)
     first_time = time.time()
@@ -773,7 +1022,11 @@ def run_training(training_config, model_config, loss_config):
     try:
         for i in tqdm.tqdm(range(start_step, training_config.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
             rng, step_rng = jax.random.split(rng)
-            batch = sample_train_batch()
+            if rollout_training:
+                rollout_horizon = rollout_horizon_for_step(i, training_config)
+                batch = sample_train_batches[rollout_horizon]()
+            else:
+                batch = sample_train_batch()
             state, update_info = train_step(
                 state,
                 ae_state,
@@ -793,7 +1046,35 @@ def run_training(training_config, model_config, loss_config):
 
             if i % training_config.log_interval == 0:
                 metrics = {f'training/{k}': v for k, v in to_float_dict(update_info).items()}
-                if len(val_batches) > 0:
+                if rollout_training:
+                    for horizon, horizon_batches in val_batches.items():
+                        val_metric_dicts = [
+                            to_float_dict(
+                                eval_step(
+                                    state,
+                                    ae_state,
+                                    val_batch,
+                                    mean,
+                                    std,
+                                    loss_config.recon_weight,
+                                    loss_config.latent_weight,
+                                    loss_config.xy_weight,
+                                    loss_config.xy_tolerance,
+                                    loss_config.gramian_diag_eps,
+                                    loss_config.gramian_warmup_steps,
+                                    loss_config.differentiate_gramian,
+                                    loss_config.latent_loss_mode,
+                                )
+                            )
+                            for val_batch in horizon_batches
+                        ]
+                        metrics.update(
+                            {
+                                f'validation/h{horizon}/{key}': value
+                                for key, value in average_metrics(val_metric_dicts).items()
+                            }
+                        )
+                elif len(val_batches) > 0:
                     val_metric_dicts = [
                         to_float_dict(
                             eval_step(
@@ -814,7 +1095,9 @@ def run_training(training_config, model_config, loss_config):
                         )
                         for val_batch in val_batches
                     ]
-                    metrics.update({f'validation/{k}': v for k, v in average_metrics(val_metric_dicts).items()})
+                    metrics.update(
+                        {f'validation/{key}': value for key, value in average_metrics(val_metric_dicts).items()}
+                    )
                 metrics['optimizer/lr'] = training_config.lr
                 metrics['time/epoch_time'] = (time.time() - last_time) / training_config.log_interval
                 metrics['time/total_time'] = time.time() - first_time
@@ -853,7 +1136,7 @@ def run_training(training_config, model_config, loss_config):
             )
     finally:
         train_logger.close()
-        if prefetcher is not None:
+        for prefetcher in prefetchers:
             prefetcher.close()
 
 

@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from impls.utils.datasets import Dataset
 from latent.train.dynamics import LatentDynamics
 from latent.train.train_autoencoder import (
     ModelConfig as AutoEncoderModelConfig,
@@ -19,6 +20,8 @@ from latent.train.train_dynamics import (
     DynamicsLossConfig,
     DynamicsModelConfig,
     DynamicsTrainingConfig,
+    RolloutDataset,
+    apply_dynamics_rollout,
     create_train_state,
     dynamics_loss,
     encode_transition_dataset,
@@ -26,6 +29,7 @@ from latent.train.train_dynamics import (
     load_autoencoder_artifacts,
     make_transition_dataset,
     restore_checkpoint,
+    rollout_horizon_for_step,
     save_checkpoint,
     train_step,
     validate_loss_config,
@@ -87,7 +91,14 @@ def make_dynamics_model_config(latent_dim=2, action_dim=1, prediction_type='abso
     )
 
 
-def make_dynamics_training_config(save_dir, ae_checkpoint_path='ae.pkl'):
+def make_dynamics_training_config(
+    save_dir,
+    ae_checkpoint_path='ae.pkl',
+    train_steps=2,
+    rollout_horizons=(1,),
+    rollout_horizon1_steps=0,
+    rollout_horizon5_steps=0,
+):
     return DynamicsTrainingConfig(
         run_group='test-dynamics',
         seed=0,
@@ -101,13 +112,16 @@ def make_dynamics_training_config(save_dir, ae_checkpoint_path='ae.pkl'):
         ae_checkpoint_path=ae_checkpoint_path,
         lr=1e-3,
         batch_size=2,
-        train_steps=2,
+        train_steps=train_steps,
         log_interval=1,
         save_interval=2,
         prefetch_batches=0,
         validation_batches=1,
         validation_batch_size=2,
         encoder_batch_size=2,
+        rollout_horizons=rollout_horizons,
+        rollout_horizon1_steps=rollout_horizon1_steps,
+        rollout_horizon5_steps=rollout_horizon5_steps,
     )
 
 
@@ -194,6 +208,56 @@ class DynamicsTrainingTest(unittest.TestCase):
                 'bad',
             )
 
+    def test_rollout_dataset_excludes_reset_crossings(self):
+        size = 8
+        values = np.arange(size, dtype=np.float32)
+        dataset = Dataset.create(
+            observations=np.stack([values, values], axis=-1),
+            latents=np.stack([values, values + 0.5], axis=-1),
+            actions=values[:, None],
+            next_latents=np.stack([values + 10.0, values + 20.0], axis=-1),
+            next_observations=np.stack([values + 30.0, values + 40.0], axis=-1),
+            raw_next_observations=np.stack([values + 50.0, values + 60.0], axis=-1),
+            terminals=np.array([0, 0, 0, 1, 0, 0, 0, 1], dtype=np.float32),
+        )
+
+        rollouts = RolloutDataset(dataset, horizon=3)
+        np.testing.assert_array_equal(rollouts.valid_starts, [0, 1, 4, 5])
+        batch = rollouts.get_subset([1, 2])
+        np.testing.assert_array_equal(batch['actions'][:, :, 0], [[1, 2, 3], [4, 5, 6]])
+        np.testing.assert_array_equal(batch['next_latents'][0, :, 0], [11, 12, 13])
+        with self.assertRaises(ValueError):
+            RolloutDataset(dataset, horizon=5)
+
+    def test_rollout_curriculum_selection_and_validation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = make_dynamics_training_config(
+                tmpdir,
+                train_steps=10,
+                rollout_horizons=(1, 2, 5, 10),
+                rollout_horizon1_steps=2,
+                rollout_horizon5_steps=4,
+            )
+            validate_training_config(config)
+            self.assertEqual([rollout_horizon_for_step(step, config) for step in (1, 2, 3, 4)], [1, 1, 5, 5])
+            self.assertIn(rollout_horizon_for_step(5, config), config.rollout_horizons)
+            self.assertEqual(rollout_horizon_for_step(7, config), rollout_horizon_for_step(7, config))
+
+            with self.assertRaises(ValueError):
+                validate_training_config(make_dynamics_training_config(tmpdir, rollout_horizons=()))
+            with self.assertRaises(ValueError):
+                validate_training_config(make_dynamics_training_config(tmpdir, rollout_horizons=(1, 5, 2)))
+            with self.assertRaises(ValueError):
+                validate_training_config(
+                    make_dynamics_training_config(
+                        tmpdir,
+                        train_steps=10,
+                        rollout_horizons=(1, 2, 10),
+                        rollout_horizon1_steps=2,
+                        rollout_horizon5_steps=4,
+                    )
+                )
+
     def test_config_validation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             validate_training_config(make_dynamics_training_config(tmpdir))
@@ -244,6 +308,111 @@ class DynamicsTrainingTest(unittest.TestCase):
             np.testing.assert_array_equal(metrics['latent/loss'], metrics['latent/l2'])
             np.testing.assert_array_equal(metrics['gramian/alpha'], 0.0)
             np.testing.assert_array_equal(metrics['gramian/energy'], 0.0)
+
+    def test_horizon_one_equivalence_and_rollout_loss_averaging(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ae_model_config = make_ae_model_config()
+            ae_training_config = make_ae_training_config(tmpdir)
+            ae_state = create_autoencoder_train_state(0, ae_model_config, ae_training_config)
+            dynamics_state = create_train_state(
+                0,
+                make_dynamics_model_config(prediction_type='residual'),
+                make_dynamics_training_config(tmpdir),
+            )
+            batch = make_batch()
+            rollout_one = {key: value if key == 'latents' else value[:, None, ...] for key, value in batch.items()}
+
+            def metrics(loss_batch):
+                return dynamics_loss(
+                    dynamics_state,
+                    ae_state,
+                    dynamics_state.params,
+                    loss_batch,
+                    jnp.zeros((4,), dtype=jnp.float32),
+                    jnp.ones((4,), dtype=jnp.float32),
+                    alpha=1.0,
+                    recon_weight=1.0,
+                    latent_weight=1.0,
+                    xy_weight=5.0,
+                    xy_tolerance=1.0,
+                    gramian_diag_eps=1e-3,
+                    differentiate_gramian=False,
+                    latent_loss_mode='l2',
+                    deterministic=True,
+                )
+
+            one_step_metrics = metrics(batch)
+            rollout_one_metrics = metrics(rollout_one)
+            for key in one_step_metrics:
+                np.testing.assert_allclose(rollout_one_metrics[key], one_step_metrics[key], rtol=1e-6, err_msg=key)
+
+            rollout_three = {
+                key: value if key == 'latents' else np.repeat(value[:, None, ...], 3, axis=1)
+                for key, value in batch.items()
+            }
+            rollout_metrics = metrics(rollout_three)
+            pred_latents = apply_dynamics_rollout(
+                dynamics_state,
+                dynamics_state.params,
+                rollout_three['latents'],
+                rollout_three['actions'],
+                deterministic=True,
+            )
+            pred_observations = ae_state(pred_latents, method='decode', deterministic=True)
+            expected_latent = jnp.mean(jnp.sum((rollout_three['next_latents'] - pred_latents) ** 2, axis=-1))
+            expected_recon = jnp.mean((rollout_three['next_observations'] - pred_observations) ** 2)
+            expected_xy = jnp.mean((rollout_three['raw_next_observations'][..., :2] - pred_observations[..., :2]) ** 2)
+            np.testing.assert_allclose(
+                rollout_metrics['loss'],
+                expected_recon + expected_latent + 5.0 * expected_xy,
+                rtol=1e-6,
+            )
+            np.testing.assert_array_equal(rollout_metrics['rollout/horizon'], 3.0)
+
+            new_state, train_metrics = train_step(
+                dynamics_state,
+                ae_state,
+                rollout_three,
+                jnp.zeros((4,), dtype=jnp.float32),
+                jnp.ones((4,), dtype=jnp.float32),
+                jax.random.PRNGKey(1),
+                1.0,
+                1.0,
+                5.0,
+                1.0,
+                1e-3,
+                0,
+                False,
+                'l2',
+            )
+            self.assertEqual(new_state.step, dynamics_state.step + 1)
+            self.assertTrue(np.isfinite(float(train_metrics['loss'])))
+            np.testing.assert_array_equal(train_metrics['rollout/horizon'], 3.0)
+
+    def test_recursive_gradient_flows_from_final_step(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dynamics_state = create_train_state(
+                0,
+                make_dynamics_model_config(prediction_type='residual'),
+                make_dynamics_training_config(tmpdir),
+            )
+            initial_latents = jnp.asarray(make_batch()['latents'])
+            actions = jnp.ones((2, 3, 1), dtype=jnp.float32) * 0.1
+
+            def final_step_loss(params):
+                predictions = apply_dynamics_rollout(
+                    dynamics_state,
+                    params,
+                    initial_latents,
+                    actions,
+                    deterministic=True,
+                )
+                return jnp.mean(predictions[:, -1] ** 2)
+
+            gradients = jax.grad(final_step_loss)(dynamics_state.params)
+            leaves = jax.tree_util.tree_leaves(gradients)
+            self.assertTrue(all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves))
+            self.assertGreater(sum(float(jnp.sum(leaf**2)) for leaf in leaves), 0.0)
 
     def test_xy_loss_uses_original_units_and_zero_weight_preserves_loss(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -323,7 +492,12 @@ class DynamicsTrainingTest(unittest.TestCase):
             ae_training_config = make_ae_training_config(tmpdir)
             ae_state = create_autoencoder_train_state(0, ae_model_config, ae_training_config)
             dynamics_model_config = make_dynamics_model_config()
-            dynamics_training_config = make_dynamics_training_config(tmpdir)
+            dynamics_training_config = make_dynamics_training_config(
+                tmpdir,
+                rollout_horizons=(1, 2, 5, 10),
+                rollout_horizon1_steps=1,
+                rollout_horizon5_steps=2,
+            )
             loss_config = make_loss_config(gramian_warmup_steps=0)
             dynamics_state = create_train_state(0, dynamics_model_config, dynamics_training_config)
             mean = jnp.zeros((4,), dtype=jnp.float32)
@@ -390,10 +564,30 @@ class DynamicsTrainingTest(unittest.TestCase):
             self.assertEqual(checkpoint['loss_config']['latent_loss_mode'], 'l2')
             self.assertEqual(checkpoint['loss_config']['xy_weight'], 0.0)
             self.assertEqual(checkpoint['loss_config']['xy_tolerance'], 1.0)
+            self.assertEqual(checkpoint['training_config']['rollout_horizons'], (1, 2, 5, 10))
+            self.assertEqual(checkpoint['training_config']['rollout_horizon1_steps'], 1)
+            self.assertEqual(checkpoint['training_config']['rollout_horizon5_steps'], 2)
 
-            restored_state, restored_step = restore_checkpoint(dynamics_state, str(checkpoint_path), None)
+            restored_state, restored_step = restore_checkpoint(
+                dynamics_state,
+                str(checkpoint_path),
+                None,
+                training_config=dynamics_training_config,
+                model_config=dynamics_model_config,
+                loss_config=loss_config,
+            )
             self.assertEqual(restored_step, 2)
             self.assertEqual(restored_state.step, new_state.step)
+
+            with self.assertRaisesRegex(ValueError, 'rollout_horizons'):
+                restore_checkpoint(
+                    dynamics_state,
+                    str(checkpoint_path),
+                    None,
+                    training_config=make_dynamics_training_config(tmpdir),
+                    model_config=dynamics_model_config,
+                    loss_config=loss_config,
+                )
 
     def test_autoencoder_checkpoint_load_and_latent_encoding(self):
         with tempfile.TemporaryDirectory() as tmpdir:
