@@ -9,7 +9,8 @@ from planner.evaluation_protocol import (
     uniform_random_actions,
 )
 from planner.evaluate_planner import write_summary
-from planner.plan_antmaze import reset_antmaze
+from planner.l2rrt import Node
+from planner.plan_antmaze import _minimum_tree_goal_xy_distance, reset_antmaze
 
 
 def test_antmaze_reset_helper_is_deterministic_for_fixed_task():
@@ -48,6 +49,16 @@ def test_baseline_proposals_reject_invalid_pools():
         demonstrated_random_actions(np.random.default_rng(0), np.zeros((1, 2, 1)), np.array([0]), 2)
     with np.testing.assert_raises(ValueError):
         uniform_random_actions(np.random.default_rng(0), np.array([np.nan]), np.array([1.0]), 2)
+
+
+def test_minimum_tree_goal_xy_distance_uses_all_tree_nodes():
+    planner = type('PlannerStub', (), {})()
+    planner.nodes = [
+        Node(0, -1, np.array([0.0]), np.array([0.0, 0.0, 1.0]), 0.0, 0, 0),
+        Node(1, 0, np.array([1.0]), np.array([3.0, 4.0, 2.0]), 1.0, 1, 1),
+        Node(2, 1, np.array([2.0]), np.array([9.0, 9.0, 3.0]), 2.0, 2, 2),
+    ]
+    assert _minimum_tree_goal_xy_distance(planner, np.array([4.0, 4.0])) == 1.0
 
 
 def test_failure_taxonomy_and_offline_summary_are_measurement_based(tmp_path):

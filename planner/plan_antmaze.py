@@ -120,6 +120,14 @@ def _plot_xy(
     plt.close(figure)
 
 
+def _minimum_tree_goal_xy_distance(planner: L2RRTPlanner, goal_xy: np.ndarray) -> float:
+    """Return the nearest decoded tree endpoint to the AntMaze goal in world XY."""
+    if not planner.nodes:
+        return float('inf')
+    node_xy = np.stack([node.observation[:2] for node in planner.nodes])
+    return float(np.min(np.linalg.norm(node_xy - np.asarray(goal_xy, dtype=np.float32), axis=-1)))
+
+
 def _execute(
     env: Any,
     actions: np.ndarray,
@@ -274,14 +282,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             seed=args.planner_seed,
         )
         result = planner.plan(start_latent, observation)
-        if len(result.predicted_observations):
-            result.best_predicted_goal_distance = float(
-                np.min(
-                    np.linalg.norm(
-                        result.predicted_observations[:, :2] - np.asarray(env.unwrapped.cur_goal_xy), axis=-1
-                    )
-                )
-            )
+        result.best_predicted_goal_distance = _minimum_tree_goal_xy_distance(
+            planner, np.asarray(env.unwrapped.cur_goal_xy)
+        )
         path_xy = result.predicted_observations[:, :2] if len(result.predicted_observations) else observation[None, :2]
         minimum_wall_clearance = geometry.polyline_clearance(path_xy)
         minimum_cycle_error_margin = None
