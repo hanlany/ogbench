@@ -96,19 +96,69 @@ def _plot_xy(
     points: np.ndarray,
     tree_lines: list[tuple[np.ndarray, np.ndarray]] | None = None,
     actual: np.ndarray | None = None,
+    geometry: MazeGeometry | None = None,
+    connect_points: bool = True,
 ) -> None:
     import matplotlib
 
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
     points = np.asarray(points, dtype=np.float32)
     figure, axis = plt.subplots(figsize=(10, 7), constrained_layout=True)
+    if geometry is not None:
+        half = geometry.maze_unit / 2
+        for i, j in zip(*np.where(geometry.maze_map == 1)):
+            center = geometry.cell_center((int(i), int(j)))
+            axis.add_patch(
+                Rectangle(
+                    (center[0] - half, center[1] - half),
+                    geometry.maze_unit,
+                    geometry.maze_unit,
+                    facecolor='0.25',
+                    edgecolor='black',
+                    linewidth=0.7,
+                    zorder=0,
+                )
+            )
+            if geometry.clearance > 0:
+                expanded_half = half + geometry.clearance
+                axis.add_patch(
+                    Rectangle(
+                        (center[0] - expanded_half, center[1] - expanded_half),
+                        2 * expanded_half,
+                        2 * expanded_half,
+                        fill=False,
+                        edgecolor='tab:red',
+                        linestyle='--',
+                        linewidth=0.6,
+                        alpha=0.7,
+                        zorder=1,
+                    )
+                )
+        xmin, xmax, ymin, ymax = geometry.bounds
+        axis.add_patch(
+            Rectangle(
+                (xmin, ymin),
+                xmax - xmin,
+                ymax - ymin,
+                fill=False,
+                edgecolor='black',
+                linewidth=1.2,
+                zorder=1,
+            )
+        )
+        axis.set_xlim(xmin, xmax)
+        axis.set_ylim(ymin, ymax)
     if tree_lines:
         for start, end in tree_lines:
-            axis.plot([start[0], end[0]], [start[1], end[1]], color='0.75', linewidth=0.5)
+            axis.plot([start[0], end[0]], [start[1], end[1]], color='tab:blue', linewidth=0.5, alpha=0.55)
     if len(points):
-        axis.plot(points[:, 0], points[:, 1], '-o', color='tab:blue', markersize=2, label='predicted')
+        if connect_points:
+            axis.plot(points[:, 0], points[:, 1], '-o', color='tab:blue', markersize=2, label='predicted')
+        else:
+            axis.scatter(points[:, 0], points[:, 1], s=4, color='tab:blue', label='tree nodes', zorder=2)
         axis.scatter(points[0, 0], points[0, 1], color='tab:green', label='start', zorder=3)
     if actual is not None and len(actual):
         axis.plot(actual[:, 0], actual[:, 1], '--', color='tab:orange', label='actual')
@@ -117,6 +167,87 @@ def _plot_xy(
     axis.set(title=title, xlabel='world x', ylabel='world y', aspect='equal')
     axis.legend(loc='best')
     figure.savefig(path, dpi=160)
+    plt.close(figure)
+
+
+def _save_tree_growth_gif(
+    path: Path,
+    *,
+    geometry: MazeGeometry,
+    goal_xy: np.ndarray,
+    node_points: np.ndarray,
+    node_iterations: np.ndarray,
+    segments: np.ndarray,
+    segment_iterations: np.ndarray,
+    max_frames: int = 100,
+    fps: int = 10,
+) -> None:
+    """Animate the accepted tree in creation-iteration order."""
+    import matplotlib
+
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    from matplotlib.collections import LineCollection
+    from matplotlib.patches import Rectangle
+
+    if max_frames <= 0 or fps <= 0:
+        raise ValueError('Tree GIF max_frames and fps must be positive.')
+    node_points = np.asarray(node_points, dtype=np.float32)
+    node_iterations = np.asarray(node_iterations, dtype=np.int64)
+    segments = np.asarray(segments, dtype=np.float32).reshape(-1, 2, 2)
+    segment_iterations = np.asarray(segment_iterations, dtype=np.int64)
+    last_iteration = int(max(np.max(node_iterations, initial=0), np.max(segment_iterations, initial=0)))
+    frame_iterations = np.unique(np.linspace(0, last_iteration, min(max_frames, last_iteration + 1), dtype=np.int64))
+
+    figure, axis = plt.subplots(figsize=(10, 7), constrained_layout=True)
+    half = geometry.maze_unit / 2
+    for i, j in zip(*np.where(geometry.maze_map == 1)):
+        center = geometry.cell_center((int(i), int(j)))
+        axis.add_patch(
+            Rectangle(
+                (center[0] - half, center[1] - half),
+                geometry.maze_unit,
+                geometry.maze_unit,
+                facecolor='0.25',
+                edgecolor='black',
+                linewidth=0.7,
+            )
+        )
+        if geometry.clearance > 0:
+            expanded_half = half + geometry.clearance
+            axis.add_patch(
+                Rectangle(
+                    (center[0] - expanded_half, center[1] - expanded_half),
+                    2 * expanded_half,
+                    2 * expanded_half,
+                    fill=False,
+                    edgecolor='tab:red',
+                    linestyle='--',
+                    linewidth=0.6,
+                    alpha=0.7,
+                )
+            )
+    xmin, xmax, ymin, ymax = geometry.bounds
+    axis.set(xlim=(xmin, xmax), ylim=(ymin, ymax), aspect='equal', xlabel='world x', ylabel='world y')
+    axis.scatter(node_points[0, 0], node_points[0, 1], color='tab:green', label='start', zorder=4)
+    goal_xy = np.asarray(goal_xy, dtype=np.float32)
+    axis.scatter(goal_xy[0], goal_xy[1], marker='*', s=100, color='tab:red', label='goal', zorder=4)
+    edge_collection = LineCollection([], colors='tab:blue', linewidths=0.65, alpha=0.65, zorder=2)
+    axis.add_collection(edge_collection)
+    node_collection = axis.scatter([], [], s=5, color='tab:blue', zorder=3, label='tree nodes')
+    title = axis.set_title('')
+    axis.legend(loc='best')
+
+    def update(iteration: int):
+        edge_collection.set_segments(segments[segment_iterations <= iteration])
+        visible_nodes = node_points[node_iterations <= iteration]
+        node_collection.set_offsets(visible_nodes)
+        title.set_text(f'L2RRT tree growth XY — iteration {iteration}/{last_iteration}')
+        return edge_collection, node_collection, title
+
+    animation = FuncAnimation(figure, update, frames=frame_iterations, interval=1000 / fps, blit=False)
+    animation.save(path, writer=PillowWriter(fps=fps), dpi=100)
     plt.close(figure)
 
 
@@ -313,11 +444,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else 0.0,
         }
         result_path['failure_taxonomy'] = classify_failure(result_path)
-        tree_lines = [
-            (planner.nodes[node.parent].observation[:2], node.observation[:2])
-            for node in planner.nodes
-            if node.parent >= 0
-        ]
+        tree_lines = []
+        tree_segment_iterations = []
+        for node in planner.nodes:
+            if node.parent < 0:
+                continue
+            edge_points = np.concatenate(
+                (planner.nodes[node.parent].observation[None, :2], planner.edges[node.index].observations[:, :2]),
+                axis=0,
+            )
+            tree_lines.extend(zip(edge_points[:-1], edge_points[1:]))
+            tree_segment_iterations.extend([node.creation_iteration] * (len(edge_points) - 1))
         fallback_points = np.asarray([observation], dtype=np.float32)
         _plot_xy(
             output_dir / 'plots/tree_xy.png',
@@ -325,12 +462,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             goal_xy=np.asarray(env.unwrapped.cur_goal_xy),
             points=np.stack([node.observation[:2] for node in planner.nodes]),
             tree_lines=tree_lines,
+            geometry=geometry,
+            connect_points=False,
         )
+        if args.tree_gif:
+            _save_tree_growth_gif(
+                output_dir / 'plots/tree_growth_xy.gif',
+                geometry=geometry,
+                goal_xy=np.asarray(env.unwrapped.cur_goal_xy),
+                node_points=np.stack([node.observation[:2] for node in planner.nodes]),
+                node_iterations=np.asarray([node.creation_iteration for node in planner.nodes]),
+                segments=np.asarray(tree_lines, dtype=np.float32),
+                segment_iterations=np.asarray(tree_segment_iterations, dtype=np.int64),
+                max_frames=args.tree_gif_frames,
+                fps=args.tree_gif_fps,
+            )
         _plot_xy(
             output_dir / 'plots/predicted_plan_xy.png',
             'Predicted plan XY',
             goal_xy=np.asarray(env.unwrapped.cur_goal_xy),
             points=result.predicted_observations[:, :2] if len(result.predicted_observations) else fallback_points,
+            geometry=geometry,
         )
         execution = None
         if args.execute and result.goal_node is not None:
@@ -367,6 +519,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 goal_xy=np.asarray(env.unwrapped.cur_goal_xy),
                 points=result.predicted_observations[:, :2],
                 actual=execution['observations'][:, :2],
+                geometry=geometry,
             )
             if args.video:
                 import imageio.v2 as imageio
@@ -433,6 +586,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument('--divergence_threshold', type=float, default=1.0)
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--video', action='store_true', help='Reserved for the execution-video follow-up.')
+    parser.add_argument('--tree_gif', action='store_true', help='Write plots/tree_growth_xy.gif.')
+    parser.add_argument('--tree_gif_frames', type=int, default=100, help='Maximum number of sampled growth frames.')
+    parser.add_argument('--tree_gif_fps', type=int, default=10)
     return parser
 
 

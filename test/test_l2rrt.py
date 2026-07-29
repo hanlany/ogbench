@@ -1,7 +1,8 @@
 import numpy as np
 
+from planner.collision import MazeGeometry
 from planner.l2rrt import L2RRTPlanner, Node, PlannerConfig, make_metric
-from planner.plan_antmaze import _plot_xy, _write_tree
+from planner.plan_antmaze import _plot_xy, _save_tree_growth_gif, _write_tree
 
 
 def _system_propagate(initial, actions, lengths):
@@ -178,3 +179,46 @@ def test_synthetic_output_bundle_artifacts(tmp_path):
         points=np.column_stack((result.predicted_observations[:, 0], np.zeros(len(result.predicted_observations)))),
     )
     assert plot_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+
+
+def test_xy_plot_accepts_maze_geometry(tmp_path):
+    geometry = MazeGeometry(np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]]), 2.0, 2.0, 2.0, clearance=0.1)
+    plot_path = tmp_path / 'maze_plot.png'
+    _plot_xy(
+        plot_path,
+        'maze geometry',
+        goal_xy=np.array([0.0, 0.0]),
+        points=np.array([[0.0, 0.0]], dtype=np.float32),
+        geometry=geometry,
+    )
+    assert plot_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+
+
+def test_xy_plot_can_render_unconnected_tree_nodes(tmp_path):
+    plot_path = tmp_path / 'tree_plot.png'
+    _plot_xy(
+        plot_path,
+        'tree',
+        goal_xy=np.array([2.0, 0.0]),
+        points=np.array([[0.0, 0.0], [2.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+        tree_lines=[(np.array([0.0, 0.0]), np.array([1.0, 1.0]))],
+        connect_points=False,
+    )
+    assert plot_path.read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+
+
+def test_tree_growth_gif(tmp_path):
+    geometry = MazeGeometry(np.zeros((3, 3), dtype=np.int8), 2.0, 2.0, 2.0)
+    gif_path = tmp_path / 'tree.gif'
+    _save_tree_growth_gif(
+        gif_path,
+        geometry=geometry,
+        goal_xy=np.array([2.0, 2.0]),
+        node_points=np.array([[-2.0, -2.0], [0.0, 0.0], [2.0, 2.0]]),
+        node_iterations=np.array([0, 2, 4]),
+        segments=np.array([[[-2.0, -2.0], [0.0, 0.0]], [[0.0, 0.0], [2.0, 2.0]]]),
+        segment_iterations=np.array([2, 4]),
+        max_frames=3,
+        fps=2,
+    )
+    assert gif_path.read_bytes().startswith(b'GIF8')
