@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Keep planner inference from reserving JAX's usual large share of the GPU.
+# An explicitly configured value from the caller always takes precedence.
+os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.25')
 
 import jax
 import jax.numpy as jnp
